@@ -42,6 +42,12 @@ interface IfcAPI {
       modelID: number,
       includeProperties?: boolean
     ): Promise<SpatialNode>;
+    getMaterialsProperties(
+      modelID: number,
+      elementID?: number,
+      recursive?: boolean,
+      includeTypeMaterials?: boolean
+    ): Promise<IfcElement[]>;
   };
 }
 
@@ -58,6 +64,29 @@ interface PropertySet {
   properties: PropertyValue[];
 }
 
+// Interface for material information
+interface MaterialInfo {
+  name: string;
+  category?: string;
+  description?: string;
+  properties?: PropertyValue[];
+}
+
+// Interface for material layer information
+interface MaterialLayer {
+  index: number;
+  thickness: number;
+  material: string;
+}
+
+// Interface for structured material information
+interface StructuredMaterialInfo {
+  name: string;
+  type: string;
+  layers?: MaterialLayer[];
+  properties?: PropertyValue[];
+}
+
 // Interface for physical element with properties
 interface IfcModelElement {
   id: number;
@@ -66,6 +95,8 @@ interface IfcModelElement {
   name: string;
   globalId?: string;
   propertySets: PropertySet[];
+  materials: MaterialInfo[];
+  structuredMaterials?: StructuredMaterialInfo[];
   rawElement?: Record<string, unknown>;
 }
 
@@ -107,8 +138,6 @@ export default function IfcBuiltElementsLoader() {
   >({});
   const [ifcApi, setIfcApi] = useState<IfcAPI | null>(null);
   const [modelID, setModelID] = useState<number | null>(null);
-  const [showAllElements, setShowAllElements] = useState(false);
-  const [showRawData, setShowRawData] = useState(false);
 
   // Function to add logs
   const addLog = (message: string) => {
@@ -176,8 +205,9 @@ export default function IfcBuiltElementsLoader() {
       propName.includes("NominalValue")
     ) {
       // Extract property name from pattern if possible
-      const match = /HasProperties\[\d+\]\.Name\.value\s*=\s*['"]([^'"]+)['"]/;
-      if (match && match[1]) {
+      const regex = /HasProperties\[\d+\]\.Name\.value\s*=\s*['"]([^'"]+)['"]/;
+      const match = regex.exec(propName);
+      if (match && match.length > 1) {
         name = match[1];
       } else {
         name = propName.replace(
@@ -333,6 +363,367 @@ export default function IfcBuiltElementsLoader() {
     }
   };
 
+  // Extract material information for an element
+  const extractMaterialsInfo = async (
+    api: IfcAPI,
+    modelId: number,
+    elementId: number
+  ): Promise<MaterialInfo[]> => {
+    try {
+      // Get materials for the element
+      const materials = await api.properties.getMaterialsProperties(
+        modelId,
+        elementId,
+        true,
+        true // Include type materials
+      );
+
+      const result: MaterialInfo[] = [];
+
+      // Process each material
+      for (const material of materials) {
+        // Skip if not a material
+        if (!material) continue;
+
+        // Extract material name
+        let name = "Unnamed Material";
+        if (material.Name && material.Name.value !== undefined) {
+          name = String(material.Name.value);
+        }
+
+        // Extract material category if available
+        let category: string | undefined;
+        if (
+          material.Category &&
+          (material.Category as IfcProperty).value !== undefined
+        ) {
+          category = String((material.Category as IfcProperty).value);
+        }
+
+        // Extract material description if available
+        let description: string | undefined;
+        if (
+          material.Description &&
+          (material.Description as IfcProperty).value !== undefined
+        ) {
+          description = String((material.Description as IfcProperty).value);
+        }
+
+        // Extract material properties if available
+        const properties: PropertyValue[] = [];
+
+        // Check for common material properties
+        if (
+          material.Density &&
+          (material.Density as IfcProperty).value !== undefined
+        ) {
+          properties.push({
+            name: "Density",
+            value: Number((material.Density as IfcProperty).value),
+            type: "number",
+          });
+        }
+
+        // Handle different material types
+        if (material.type === "IFCMATERIAL") {
+          // Simple material - already handled above
+        }
+        // Handle material layer set (for layered walls, slabs, etc.)
+        else if (
+          material.type === "IFCMATERIALLAYERSET" ||
+          material.MaterialLayers
+        ) {
+          const layers = material.MaterialLayers || [];
+          if (Array.isArray(layers)) {
+            for (let i = 0; i < layers.length; i++) {
+              const layer = layers[i];
+
+              // Extract layer thickness if available
+              if (
+                layer.LayerThickness &&
+                layer.LayerThickness.value !== undefined
+              ) {
+                properties.push({
+                  name: `Layer ${i + 1} Thickness`,
+                  value: Number(layer.LayerThickness.value),
+                  type: "number",
+                });
+              }
+
+              // Extract layer material if available
+              if (layer.Material) {
+                const layerMaterial = layer.Material;
+                let layerMaterialName = "Unknown";
+
+                if (
+                  layerMaterial.Name &&
+                  layerMaterial.Name.value !== undefined
+                ) {
+                  layerMaterialName = String(layerMaterial.Name.value);
+                }
+
+                properties.push({
+                  name: `Layer ${i + 1} Material`,
+                  value: layerMaterialName,
+                  type: "string",
+                });
+
+                // Add layer material as a separate material
+                result.push({
+                  name: layerMaterialName,
+                  category: "Layer Material",
+                  description: `Layer ${i + 1} in ${name}`,
+                  properties: [],
+                });
+              }
+            }
+          }
+        }
+        // Handle material profile set (for beams, columns, etc.)
+        else if (
+          material.type === "IFCMATERIALPROFILESET" ||
+          material.MaterialProfiles
+        ) {
+          const profiles = material.MaterialProfiles || [];
+          if (Array.isArray(profiles)) {
+            for (let i = 0; i < profiles.length; i++) {
+              const profile = profiles[i];
+
+              // Extract profile name if available
+              let profileName = `Profile ${i + 1}`;
+              if (profile.Name && profile.Name.value !== undefined) {
+                profileName = String(profile.Name.value);
+              }
+
+              properties.push({
+                name: `Profile ${i + 1} Name`,
+                value: profileName,
+                type: "string",
+              });
+
+              // Extract profile material if available
+              if (profile.Material) {
+                const profileMaterial = profile.Material;
+                let profileMaterialName = "Unknown";
+
+                if (
+                  profileMaterial.Name &&
+                  profileMaterial.Name.value !== undefined
+                ) {
+                  profileMaterialName = String(profileMaterial.Name.value);
+                }
+
+                properties.push({
+                  name: `Profile ${i + 1} Material`,
+                  value: profileMaterialName,
+                  type: "string",
+                });
+
+                // Add profile material as a separate material
+                result.push({
+                  name: profileMaterialName,
+                  category: "Profile Material",
+                  description: `Profile ${i + 1} in ${name}`,
+                  properties: [],
+                });
+              }
+            }
+          }
+        }
+        // Handle material constituent set (for complex materials)
+        else if (
+          material.type === "IFCMATERIALCONSTITUENTSET" ||
+          material.MaterialConstituents
+        ) {
+          const constituents = material.MaterialConstituents || [];
+          if (Array.isArray(constituents)) {
+            for (let i = 0; i < constituents.length; i++) {
+              const constituent = constituents[i];
+
+              // Extract constituent name if available
+              let constituentName = `Constituent ${i + 1}`;
+              if (constituent.Name && constituent.Name.value !== undefined) {
+                constituentName = String(constituent.Name.value);
+              }
+
+              properties.push({
+                name: `Constituent ${i + 1} Name`,
+                value: constituentName,
+                type: "string",
+              });
+
+              // Extract constituent material if available
+              if (constituent.Material) {
+                const constituentMaterial = constituent.Material;
+                let constituentMaterialName = "Unknown";
+
+                if (
+                  constituentMaterial.Name &&
+                  constituentMaterial.Name.value !== undefined
+                ) {
+                  constituentMaterialName = String(
+                    constituentMaterial.Name.value
+                  );
+                }
+
+                properties.push({
+                  name: `Constituent ${i + 1} Material`,
+                  value: constituentMaterialName,
+                  type: "string",
+                });
+
+                // Add constituent material as a separate material
+                result.push({
+                  name: constituentMaterialName,
+                  category: "Constituent Material",
+                  description: `Constituent ${i + 1} in ${name}`,
+                  properties: [],
+                });
+              }
+            }
+          }
+        }
+
+        // Add material to result
+        result.push({
+          name,
+          category,
+          description,
+          properties: properties.length > 0 ? properties : undefined,
+        });
+      }
+
+      addLog(`Found ${result.length} materials for element ${elementId}`);
+      return result;
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      addLog(`Error getting materials for element ${elementId}: ${errMsg}`);
+      return [];
+    }
+  };
+
+  // Organize materials into a structured format
+  const organizeStructuredMaterials = (
+    materials: MaterialInfo[]
+  ): StructuredMaterialInfo[] => {
+    const result: StructuredMaterialInfo[] = [];
+
+    // Find layer set materials (materials with layer properties)
+    const layerSetMaterials = materials.filter(
+      (m) =>
+        m.properties &&
+        m.properties.some(
+          (p) => p.name.includes("Layer") && p.name.includes("Thickness")
+        )
+    );
+
+    // Process each layer set material
+    for (const layerSetMaterial of layerSetMaterials) {
+      if (!layerSetMaterial.properties) continue;
+
+      const layers: MaterialLayer[] = [];
+      const materialType = layerSetMaterial.category || "Material Set";
+
+      // Extract layer information
+      for (let i = 1; i <= 20; i++) {
+        // Assume max 20 layers
+        const thicknessProp = layerSetMaterial.properties.find(
+          (p) => p.name === `Layer ${i} Thickness`
+        );
+
+        const materialProp = layerSetMaterial.properties.find(
+          (p) => p.name === `Layer ${i} Material`
+        );
+
+        if (thicknessProp && materialProp) {
+          layers.push({
+            index: i,
+            thickness: Number(thicknessProp.value),
+            material: String(materialProp.value),
+          });
+        }
+      }
+
+      // Create structured material info
+      if (layers.length > 0) {
+        result.push({
+          name: layerSetMaterial.name,
+          type: "LayerSet",
+          layers,
+          properties: layerSetMaterial.properties.filter(
+            (p) => !p.name.includes("Layer")
+          ),
+        });
+      }
+    }
+
+    // Find profile set materials
+    const profileSetMaterials = materials.filter(
+      (m) =>
+        m.properties &&
+        m.properties.some(
+          (p) => p.name.includes("Profile") && p.name.includes("Name")
+        )
+    );
+
+    // Process each profile set material
+    for (const profileSetMaterial of profileSetMaterials) {
+      if (!profileSetMaterial.properties) continue;
+
+      // Create structured material info
+      result.push({
+        name: profileSetMaterial.name,
+        type: "ProfileSet",
+        properties: profileSetMaterial.properties,
+      });
+    }
+
+    // Find constituent set materials
+    const constituentSetMaterials = materials.filter(
+      (m) =>
+        m.properties &&
+        m.properties.some(
+          (p) => p.name.includes("Constituent") && p.name.includes("Name")
+        )
+    );
+
+    // Process each constituent set material
+    for (const constituentSetMaterial of constituentSetMaterials) {
+      if (!constituentSetMaterial.properties) continue;
+
+      // Create structured material info
+      result.push({
+        name: constituentSetMaterial.name,
+        type: "ConstituentSet",
+        properties: constituentSetMaterial.properties,
+      });
+    }
+
+    // Add simple materials (those that aren't part of a set)
+    const processedMaterialNames = new Set([
+      ...result.flatMap((r) => r.layers?.map((l) => l.material) || []),
+      ...result.map((r) => r.name),
+    ]);
+
+    // Add remaining materials as simple materials
+    for (const material of materials) {
+      if (
+        !processedMaterialNames.has(material.name) &&
+        material.category !== "Layer Material" &&
+        material.category !== "Profile Material" &&
+        material.category !== "Constituent Material"
+      ) {
+        result.push({
+          name: material.name,
+          type: "Simple",
+          properties: material.properties,
+        });
+      }
+    }
+
+    return result;
+  };
+
   // Process a node from the spatial structure and extract element data with properties
   const processModelElement = async (
     node: SpatialNode,
@@ -386,6 +777,16 @@ export default function IfcBuiltElementsLoader() {
         node.expressID
       );
 
+      // Get material information for this element
+      const materialsInfo = await extractMaterialsInfo(
+        api,
+        modelId,
+        node.expressID
+      );
+
+      // Organize materials into a structured format
+      const structuredMaterials = organizeStructuredMaterials(materialsInfo);
+
       // Create element object
       const modelElement: IfcModelElement = {
         id: node.expressID,
@@ -394,9 +795,9 @@ export default function IfcBuiltElementsLoader() {
         name,
         globalId,
         propertySets,
-        rawElement: showRawData
-          ? (element as unknown as Record<string, unknown>)
-          : undefined,
+        materials: materialsInfo,
+        structuredMaterials,
+        rawElement: undefined,
       };
 
       addLog(
@@ -507,7 +908,7 @@ export default function IfcBuiltElementsLoader() {
           spatialTree,
           api,
           modelID,
-          showAllElements
+          false
         );
 
         addLog(`Found ${extractedElements.length} elements with properties`);
@@ -542,9 +943,22 @@ export default function IfcBuiltElementsLoader() {
           0
         );
 
+        // Calculate materials statistics
+        const totalMaterials = extractedElements.reduce(
+          (total, element) => total + element.materials.length,
+          0
+        );
+
+        // Calculate structured materials statistics
+        const totalStructuredMaterials = extractedElements.reduce(
+          (total, element) =>
+            total + (element.structuredMaterials?.length || 0),
+          0
+        );
+
         // Set success message
         setResult(
-          `Successfully processed IFC file. Found ${extractedElements.length} elements with ${totalPropertySets} property sets and ${totalProperties} total properties.`
+          `Successfully processed IFC file. Found ${extractedElements.length} elements with ${totalPropertySets} property sets, ${totalProperties} total properties, and ${totalMaterials} materials (${totalStructuredMaterials} structured).`
         );
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
@@ -584,21 +998,23 @@ export default function IfcBuiltElementsLoader() {
     setShowLogs(!showLogs);
   };
 
-  // Function to toggle showing all elements
-  const toggleShowAllElements = () => {
-    setShowAllElements(!showAllElements);
-  };
-
-  // Function to toggle showing raw data
-  const toggleShowRawData = () => {
-    setShowRawData(!showRawData);
-  };
-
   // Function to download element data as JSON
   const handleDownloadElements = () => {
     if (elements.length === 0) return;
 
-    const jsonString = JSON.stringify(elements, null, 2);
+    // Create a simplified version of the elements for JSON export
+    const exportElements = elements.map((element) => ({
+      id: element.id,
+      type: element.type,
+      typeName: element.typeName,
+      name: element.name,
+      globalId: element.globalId,
+      propertySets: element.propertySets,
+      materials: element.materials,
+      structuredMaterials: element.structuredMaterials,
+    }));
+
+    const jsonString = JSON.stringify(exportElements, null, 2);
     const blob = new Blob([jsonString], { type: "application/json" });
     const url = URL.createObjectURL(blob);
 
@@ -696,15 +1112,6 @@ export default function IfcBuiltElementsLoader() {
 
             <div className="space-x-2">
               <button
-                onClick={toggleShowAllElements}
-                className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700 transition-colors"
-              >
-                {showAllElements
-                  ? "Show Physical Elements Only"
-                  : "Show All Elements"}
-              </button>
-
-              <button
                 onClick={handleDownloadElements}
                 className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
               >
@@ -787,6 +1194,210 @@ export default function IfcBuiltElementsLoader() {
                                 </tbody>
                               </table>
                             </div>
+
+                            {/* Materials Section */}
+                            {element.materials &&
+                              element.materials.length > 0 && (
+                                <div className="mt-4 mb-4">
+                                  <h6 className="font-medium text-sm text-gray-800 mb-1">
+                                    Materials ({element.materials.length})
+                                  </h6>
+
+                                  {/* Structured Materials Display */}
+                                  {element.structuredMaterials &&
+                                    element.structuredMaterials.length > 0 && (
+                                      <div className="mb-4">
+                                        {element.structuredMaterials.map(
+                                          (structMaterial, smIndex) => (
+                                            <div
+                                              key={smIndex}
+                                              className="mb-3 border-l-2 border-green-300 pl-3"
+                                            >
+                                              <div className="font-medium text-xs text-green-700 flex justify-between">
+                                                <span>
+                                                  {structMaterial.name}
+                                                </span>
+                                                <span className="bg-green-100 px-2 py-0.5 rounded text-xs">
+                                                  {structMaterial.type}
+                                                </span>
+                                              </div>
+
+                                              {/* Display layers for LayerSet materials */}
+                                              {structMaterial.type ===
+                                                "LayerSet" &&
+                                                structMaterial.layers && (
+                                                  <div className="mt-2">
+                                                    <div className="text-xs font-medium text-gray-600 mb-1">
+                                                      Layers (
+                                                      {
+                                                        structMaterial.layers
+                                                          .length
+                                                      }
+                                                      )
+                                                    </div>
+                                                    <div className="overflow-x-auto">
+                                                      <table className="min-w-full text-xs">
+                                                        <thead>
+                                                          <tr className="bg-green-50">
+                                                            <th className="px-2 py-1 text-left">
+                                                              Layer
+                                                            </th>
+                                                            <th className="px-2 py-1 text-left">
+                                                              Material
+                                                            </th>
+                                                            <th className="px-2 py-1 text-right">
+                                                              Thickness
+                                                            </th>
+                                                          </tr>
+                                                        </thead>
+                                                        <tbody className="divide-y divide-green-100">
+                                                          {structMaterial.layers.map(
+                                                            (layer) => (
+                                                              <tr
+                                                                key={
+                                                                  layer.index
+                                                                }
+                                                                className="hover:bg-green-50"
+                                                              >
+                                                                <td className="px-2 py-1">
+                                                                  {layer.index}
+                                                                </td>
+                                                                <td className="px-2 py-1">
+                                                                  {
+                                                                    layer.material
+                                                                  }
+                                                                </td>
+                                                                <td className="px-2 py-1 text-right font-mono">
+                                                                  {layer.thickness.toFixed(
+                                                                    4
+                                                                  )}{" "}
+                                                                  m
+                                                                </td>
+                                                              </tr>
+                                                            )
+                                                          )}
+                                                        </tbody>
+                                                      </table>
+                                                    </div>
+                                                  </div>
+                                                )}
+
+                                              {/* Display properties for all material types */}
+                                              {structMaterial.properties &&
+                                                structMaterial.properties
+                                                  .length > 0 && (
+                                                  <div className="overflow-x-auto mt-1">
+                                                    <table className="min-w-full text-xs">
+                                                      <thead>
+                                                        <tr className="bg-green-50">
+                                                          <th className="px-4 py-1 text-left">
+                                                            Property
+                                                          </th>
+                                                          <th className="px-4 py-1 text-right">
+                                                            Value
+                                                          </th>
+                                                        </tr>
+                                                      </thead>
+                                                      <tbody className="divide-y divide-green-100">
+                                                        {structMaterial.properties.map(
+                                                          (prop, propIndex) => (
+                                                            <tr
+                                                              key={propIndex}
+                                                              className="hover:bg-green-50"
+                                                            >
+                                                              <td className="px-4 py-1">
+                                                                {prop.name}
+                                                              </td>
+                                                              <td className="px-4 py-1 text-right font-mono">
+                                                                {typeof prop.value ===
+                                                                "boolean"
+                                                                  ? prop.value
+                                                                    ? "✓ Yes"
+                                                                    : "✗ No"
+                                                                  : formatPropertyValue(
+                                                                      prop.value
+                                                                    )}
+                                                              </td>
+                                                            </tr>
+                                                          )
+                                                        )}
+                                                      </tbody>
+                                                    </table>
+                                                  </div>
+                                                )}
+                                            </div>
+                                          )
+                                        )}
+                                      </div>
+                                    )}
+
+                                  {/* Original Materials Display (hidden if structured materials are available) */}
+                                  {(!element.structuredMaterials ||
+                                    element.structuredMaterials.length === 0) &&
+                                    element.materials.map(
+                                      (material, matIndex) => (
+                                        <div
+                                          key={matIndex}
+                                          className="mb-3 border-l-2 border-blue-300 pl-3"
+                                        >
+                                          <div className="font-medium text-xs text-blue-700">
+                                            {material.name}
+                                            {material.category &&
+                                              ` (${material.category})`}
+                                          </div>
+
+                                          {material.description && (
+                                            <div className="text-xs text-gray-500 italic mb-1">
+                                              {material.description}
+                                            </div>
+                                          )}
+
+                                          {material.properties &&
+                                            material.properties.length > 0 && (
+                                              <div className="overflow-x-auto mt-1">
+                                                <table className="min-w-full text-xs">
+                                                  <thead>
+                                                    <tr className="bg-blue-50">
+                                                      <th className="px-4 py-1 text-left">
+                                                        Property
+                                                      </th>
+                                                      <th className="px-4 py-1 text-right">
+                                                        Value
+                                                      </th>
+                                                    </tr>
+                                                  </thead>
+                                                  <tbody className="divide-y divide-blue-100">
+                                                    {material.properties.map(
+                                                      (prop, propIndex) => (
+                                                        <tr
+                                                          key={propIndex}
+                                                          className="hover:bg-blue-50"
+                                                        >
+                                                          <td className="px-4 py-1">
+                                                            {prop.name}
+                                                          </td>
+                                                          <td className="px-4 py-1 text-right font-mono">
+                                                            {typeof prop.value ===
+                                                            "boolean"
+                                                              ? prop.value
+                                                                ? "✓ Yes"
+                                                                : "✗ No"
+                                                              : formatPropertyValue(
+                                                                  prop.value
+                                                                )}
+                                                          </td>
+                                                        </tr>
+                                                      )
+                                                    )}
+                                                  </tbody>
+                                                </table>
+                                              </div>
+                                            )}
+                                        </div>
+                                      )
+                                    )}
+                                </div>
+                              )}
                           </div>
                         ))}
                       </div>
@@ -808,7 +1419,14 @@ export default function IfcBuiltElementsLoader() {
                 ),
               0
             )}{" "}
-            total properties
+            total properties and{" "}
+            {elements.reduce((total, el) => total + el.materials.length, 0)}{" "}
+            materials (
+            {elements.reduce(
+              (total, el) => total + (el.structuredMaterials?.length || 0),
+              0
+            )}{" "}
+            structured)
           </p>
         </div>
       )}
